@@ -4,16 +4,72 @@ import json
 import base64
 import asyncio
 import websockets
+from urllib.parse import urlparse
 from fastapi.websockets import WebSocketDisconnect
 from fastapi import WebSocket
 from tools.functioncalling import invoke_function
+from utils import create_digishare_ticket
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-01-preview")
 active_websocket = set()
 
 
+def _build_realtime_url() -> str:
+    """Build the Azure AI Foundry (Azure OpenAI) Realtime API WebSocket URL."""
+    host = urlparse(AZURE_OPENAI_ENDPOINT).netloc or AZURE_OPENAI_ENDPOINT
+    return (
+        f"wss://{host}/openai/realtime"
+        f"?api-version={AZURE_OPENAI_API_VERSION}"
+        f"&deployment={AZURE_OPENAI_DEPLOYMENT_NAME}"
+    )
 
-VOICE= 'alloy'
+
+
+# Realtime voice options: alloy, ash, ballad, coral, echo, sage, shimmer, verse, marin, cedar.
+# marin/cedar are the newest, most natural-sounding voices for the gpt-realtime model family.
+VOICE = os.getenv("AZURE_REALTIME_VOICE", "marin")
+
+
+def build_turn_detection_config() -> dict | None:
+    """Builds the session's `turn_detection` config, i.e. how the model decides the
+    caller has finished a turn and it should respond.
+
+    AZURE_REALTIME_TURN_DETECTION selects the mode:
+    - "server_vad" (default): silence-based. Fires after AZURE_REALTIME_VAD_SILENCE_MS
+      of silence. Fast and predictable, but a shorter silence_duration_ms can cut
+      callers off mid-pause, while a longer one adds latency to every turn.
+    - "semantic_vad": model-based. Uses the words said so far to judge whether the
+      caller actually finished their thought (vs. trailing off with "euh..."),
+      rather than a fixed silence timer — generally better for natural conversation,
+      at the cost of slightly less predictable latency. Tuned via
+      AZURE_REALTIME_VAD_EAGERNESS (low/medium/high/auto).
+    - "none": disables VAD entirely (manual/push-to-talk turn handling) — not used
+      by this app's always-listening phone agent.
+    """
+    mode = os.getenv("AZURE_REALTIME_TURN_DETECTION", "server_vad")
+
+    if mode == "none":
+        return None
+
+    if mode == "semantic_vad":
+        return {
+            "type": "semantic_vad",
+            "eagerness": os.getenv("AZURE_REALTIME_VAD_EAGERNESS", "auto"),
+            "create_response": True,
+            "interrupt_response": True,
+        }
+
+    return {
+        "type": "server_vad",
+        "threshold": float(os.getenv("AZURE_REALTIME_VAD_THRESHOLD", "0.5")),
+        "prefix_padding_ms": int(os.getenv("AZURE_REALTIME_VAD_PREFIX_PADDING_MS", "300")),
+        "silence_duration_ms": int(os.getenv("AZURE_REALTIME_VAD_SILENCE_MS", "500")),
+        "create_response": True,
+        "interrupt_response": True,
+    }
 LOG_EVENT_TYPES = [
     'error', 'response.content.done', 'rate_limits.updated',
     'response.done', 'input_audio_buffer.committed',
@@ -41,11 +97,11 @@ async def send_initial_conversation_item(openai_ws,initial_message):
     await openai_ws.send(json.dumps({"type": "response.create"}))
 
 async def initialize_session(openai_ws,system_message,initial_message,tool_schemas= None):
-    """Control initial session with OpenAI."""
+    """Control initial session with Azure AI Foundry Realtime API."""
     session_update = {
         "type": "session.update",
         "session": {
-            "turn_detection": {"type": "server_vad"},
+            "turn_detection": build_turn_detection_config(),
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
@@ -64,7 +120,7 @@ async def initialize_session(openai_ws,system_message,initial_message,tool_schem
     # Uncomment the next line to have the AI speak first
     await send_initial_conversation_item(openai_ws, initial_message)
 async def handle_call(websocket: WebSocket,system_message,initial_message,tool_schemas= None):
-    """Handle WebSocket connections between Twilio and OpenAI."""
+    """Handle WebSocket connections between Twilio and Azure AI Foundry (Azure OpenAI Realtime API)."""
     print("Client connected")
     await websocket.accept()
     ssl_context = ssl.create_default_context()
@@ -72,11 +128,10 @@ async def handle_call(websocket: WebSocket,system_message,initial_message,tool_s
     ssl_context.verify_mode = ssl.CERT_NONE
 
     async with websockets.connect(
-            'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview',
+            _build_realtime_url(),
             ssl=ssl_context,
             extra_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "OpenAI-Beta": "realtime=v1"
+                "api-key": AZURE_OPENAI_API_KEY
             }
     ) as openai_ws:
         await initialize_session(openai_ws,system_message=system_message,initial_message=initial_message,tool_schemas=tool_schemas)
@@ -92,7 +147,7 @@ async def handle_call(websocket: WebSocket,system_message,initial_message,tool_s
 
 
         async def receive_from_twilio():
-            """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
+            """Receive audio data from Twilio and send it to the Azure AI Foundry Realtime API."""
             nonlocal stream_sid, latest_media_timestamp
             try:
                 async for message in websocket.iter_text():
@@ -120,7 +175,7 @@ async def handle_call(websocket: WebSocket,system_message,initial_message,tool_s
                     await openai_ws.close()
 
         async def send_to_twilio():
-            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
+            """Receive events from the Azure AI Foundry Realtime API, send audio back to Twilio."""
             nonlocal stream_sid, last_assistant_item, response_start_timestamp_twilio
             try:
                 async for openai_message in openai_ws:
@@ -140,7 +195,7 @@ async def handle_call(websocket: WebSocket,system_message,initial_message,tool_s
 
                                     print(f"Detected function call: {function_name} with arguments: {arguments}")
                                     result = await invoke_function(function_name, arguments,websocket)
-                                    # Send function_call_output to OpenAI
+                                    # Send function_call_output to Azure AI Foundry
                                     await openai_ws.send(json.dumps({
                                         "type": "conversation.item.create",
                                         "item": {
@@ -231,3 +286,15 @@ async def handle_call(websocket: WebSocket,system_message,initial_message,tool_s
                 mark_queue.append('responsePart')
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
+
+        pending_whatsapp_form = getattr(websocket, "pending_whatsapp_form", None)
+        if pending_whatsapp_form:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    create_digishare_ticket,
+                    pending_whatsapp_form["phone_number"],
+                    pending_whatsapp_form["customer_name"],
+                )
+            except Exception as e:
+                print(f"Failed to create WhatsApp survey ticket: {e}")

@@ -13,64 +13,244 @@ from starlette.responses import HTMLResponse
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from dotenv import load_dotenv
 from agents.agent import  handle_call
-from models.model import Lead
-from tools.functioncalling import inbound_caller_tool_schemas
+from agents.sip_agent import start_sip_agent
+from models.model import SupportTicket
+from tools.functioncalling import inbound_support_tool_schemas
+from tools.tools import get_customer_by_phone, get_orders_by_phone
 
 load_dotenv()
-PORT = int(os.getenv("PORT", 5050))
+PORT = int(os.getenv("PORT", 8080))
 
 SHOW_TIMING_MATH = False
 app = FastAPI()
-class Booking(BaseModel):
-    id: str
-    customer_name: str
-    room_number: str
-    check_in_date: date
-    check_out_date: date
-    phone_number: str
-    feedback: str
 
-    class Config:
-        from_attributes = True
+INITIAL_MESSAGE = """Dis bonjour et bienvenue chez Histoire d'Or, présente-toi comme son conseiller virtuel en charge de
+l'aider, puis demande comment tu peux l'aider aujourd'hui."""
+
+OUTBOUND_INITIAL_MESSAGE = """Dis bonjour, présente-toi en tant que conseiller virtuel du service client Histoire d'Or,
+explique que tu appelles au sujet de sa demande, puis demande si c'est un bon moment pour lui parler."""
 
 
+def build_outbound_initial_message(customer_number: str) -> str:
+    """Opening line instructions for an outbound call. Looks up any order(s) already
+    known for this number so the agent leads with the actual reason for the call
+    (e.g. an order status update) instead of asking the callee what they want."""
+    orders = get_orders_by_phone(customer_number)
 
-app = FastAPI()
+    if not orders:
+        return OUTBOUND_INITIAL_MESSAGE
+
+    if len(orders) == 1:
+        o = orders[0]
+        return (
+            "Dis bonjour, présente-toi en tant que conseiller virtuel du service client Histoire d'Or, "
+            f"puis annonce directement que tu appelles au sujet de sa commande {o['order_number']} "
+            f"({o['product_name']}), actuellement au statut « {o['status']} ». "
+            "Ne demande PAS à l'appelant ce qu'il souhaite : le motif de l'appel est déjà connu. "
+            "Demande ensuite si c'est un bon moment pour en parler."
+        )
+
+    return (
+        "Dis bonjour, présente-toi en tant que conseiller virtuel du service client Histoire d'Or, "
+        "puis explique que tu appelles au sujet d'une commande récente. Ce numéro est associé à plusieurs "
+        "commandes de clients différents (probablement une ligne partagée) : demande d'abord à qui tu as "
+        "l'honneur de parler avant de préciser la commande concernée. Demande ensuite si c'est un bon moment pour en parler."
+    )
+
+
+def build_system_message(customer_number: str) -> str:
+    known_customers = get_customer_by_phone(customer_number)
+    if not known_customers:
+        customer_context = (
+            "Ce numéro n'est associé à aucun client connu dans le système. Demande le nom complet "
+            "de l'appelant dès que tu l'apprends, puis utilise l'outil `add_customer_function` pour "
+            "l'enregistrer avec son numéro de téléphone (" + customer_number + "), afin qu'il soit "
+            "reconnu automatiquement lors de son prochain appel."
+        )
+    elif len(known_customers) == 1:
+        full_name = known_customers[0]["full_name"]
+        first_name = full_name.split()[0]
+        customer_context = (
+            f"Ce numéro est déjà associé à {full_name} dans le système. "
+            "Confirme que tu parles bien avec cette personne en début d'appel ; inutile de lui redemander son nom complet. "
+            f"Adresse-toi ensuite à elle par son prénom ({first_name}) tout au long de l'appel, notamment à l'accueil et à la clôture."
+        )
+    else:
+        names = ", ".join(c["full_name"] for c in known_customers)
+        customer_context = (
+            f"Ce numéro est associé à plusieurs clients connus dans le système ({names}), "
+            "probablement une ligne partagée. Demande à qui tu as l'honneur de parler pour confirmer son identité."
+        )
+
+    known_orders = get_orders_by_phone(customer_number)
+    if not known_orders:
+        order_context = "Aucune commande n'est associée à ce numéro dans le système."
+    else:
+        order_lines = "\n".join(
+            f"  - Commande {o['order_number']} ({o['customer_name']}) : {o['product_name']} "
+            f"(Réf: {o['product_reference']}) — Statut : {o['status']}"
+            for o in known_orders
+        )
+        order_context = (
+            "Voici la ou les commandes déjà connues pour ce numéro (" + customer_number + "). Ne demande PAS "
+            "le numéro de commande à l'appelant si l'une d'elles correspond visiblement à sa demande — mais "
+            "avant de communiquer le moindre détail, confirme oralement avec l'appelant que ce numéro de "
+            "téléphone est bien celui utilisé lors de la commande (par exemple : « Votre numéro de téléphone "
+            "est bien le " + customer_number + ", que vous avez utilisé lors de la validation de votre commande ? ») "
+            "et attends sa confirmation avant de donner le statut. Utilise `check_order_status_function` avec "
+            "le numéro de commande ci-dessous si tu as besoin de rafraîchir ces informations :\n" + order_lines
+        )
+
+    return """
+    Tu es le conseiller virtuel professionnel et empathique du service client d'Histoire d'Or, enseigne de bijouterie et d'accessoires. Tu ne t'occupes que d'Histoire d'Or : si l'appelant parle d'une autre enseigne (Marc Orian, AGATHA, Stroili, Ti Sento, etc.), précise poliment que tu ne peux traiter que les demandes Histoire d'Or et invite-le à contacter directement l'enseigne concernée. Ta mission est d'aider les appelants avec leurs questions sur les produits, le statut de leurs commandes, les informations sur les boutiques, et la prise de rendez-vous en boutique, et d'enregistrer un ticket pour tout problème non résolu.
+
+    Tu dois toujours parler en français avec l'appelant, quelle que soit la langue dans laquelle il te répond.
+
+    ### Client
+    """ + customer_context + """
+
+    ### Commande
+    """ + order_context + """
+
+    ### Services d'assistance client
+    - Répondre aux questions sur des produits précis ou des catégories de produits (bagues, colliers, bracelets, boucles d'oreilles, montres).
+    - Indiquer le statut d'une commande lorsque le client donne un numéro de commande.
+    - Indiquer les adresses, numéros de téléphone et horaires d'ouverture des boutiques.
+    - Proposer de **prendre un rendez-vous en boutique** (réparation, redimensionnement, gravure, nettoyage) si le client a besoin d'un service en magasin.
+    - Terminer chaque appel en enregistrant un ticket de support si le problème n'a pas été entièrement résolu ou nécessite un suivi.
+    - Veille à toujours demander le nom complet du client.
+
+    ### Outils à ta disposition
+
+    1. **`find_product_by_name_function`**
+       - Utilise cet outil si l'appelant mentionne un produit précis par son nom (par exemple, « Avez-vous la bague Solitaire ? »). Ne recherche que dans le catalogue Histoire d'Or.
+
+    2. **`find_products_by_category_function`**
+       - Utilise cet outil lorsque l'appelant cherche une catégorie générale comme les bagues, colliers, bracelets, boucles d'oreilles ou montres. Ne recherche que dans le catalogue Histoire d'Or.
+
+    3. **`search_product_on_histoire_dor_website_function`**
+       - Utilise cet outil pour rechercher directement sur le site histoiredor.com quand le catalogue local (outils 1 et 2) ne contient pas l'information demandée, ou pour des détails plus précis (prix actuel, disponibilité, descriptif) sur un produit Histoire d'Or.
+
+    4. **`check_order_status_function`**
+       - Utilise cet outil lorsque l'appelant donne un numéro de commande et souhaite en connaître le statut, ou lorsqu'une commande de la section Commande ci-dessus correspond à sa demande.
+       - Avant d'appeler cet outil, confirme oralement avec l'appelant le numéro de téléphone associé (voir la section Commande) et attends sa confirmation.
+       - Dis à l'appelant de patienter un instant le temps de vérifier, puis appelle l'outil.
+       - Une fois le résultat obtenu, annonce le statut clairement (par exemple : « après vérification, je vous informe que votre commande est actuellement [statut] »), et si elle n'est pas encore expédiée, précise qu'un e-mail de confirmation lui sera envoyé dès l'expédition pour suivre l'acheminement sur le site du transporteur.
+
+    5. **`find_store_by_city_function`**
+       - Utilise cet outil lorsque l'appelant demande l'emplacement, l'adresse, le téléphone ou les horaires d'une boutique Histoire d'Or dans une ville donnée.
+
+    6. **`book_service_appointment_function`**
+       - Utilise cet outil si le client souhaite un service en boutique comme une réparation, un redimensionnement, une gravure ou un nettoyage.
+       - Demande :
+         - Le nom complet du client
+         - Le type de service souhaité
+         - La ville de la boutique souhaitée
+         - La date et l'heure préférées
+       - Le système confirmera le rendez-vous et enverra un SMS de confirmation au client.
+
+    7. **`log_support_ticket_function`**
+       - Utilise toujours cet outil à la **fin de l'appel** si le problème de l'appelant n'a pas été entièrement résolu,
+       une fois que tu as recueilli suffisamment de détails.
+       - Renseigne :
+         - Le nom complet
+         - Le numéro de téléphone, qui est """ + customer_number + """ (inutile de le demander au client)
+         - Le type de problème (par exemple : « Problème de commande », « Question produit », « Réparation », « Réclamation », « Autre »)
+         - La priorité de 1 (faible) à 5 (élevée)
+         - Un résumé concis de ce qui a été discuté
+       - Cela garantit que le ticket est enregistré dans le système de support pour un suivi.
+
+    8. **`add_customer_function`**
+       - Utilise cet outil dès que tu apprends le nom complet d'un appelant dont le numéro n'est pas déjà associé à un client connu (voir la section Client ci-dessus).
+       - Renseigne son nom complet et son numéro de téléphone (""" + customer_number + """).
+
+    9. **`send_whatsapp_form_function`**
+       - Utilise cet outil juste avant de clore l'appel (voir « Clôture d'appel » ci-dessous), une fois que l'appelant a répondu clairement oui ou non à la proposition de recevoir un questionnaire de satisfaction par WhatsApp.
+       - S'il accepte : confirme (ou redemande) son numéro de téléphone WhatsApp, puis appelle cet outil avec `send_whatsapp_form=true`, son numéro confirmé et son nom complet.
+       - S'il refuse : appelle cet outil avec `send_whatsapp_form=false`.
+       - Ne suppose jamais que le numéro affiché est le bon : demande toujours confirmation orale avant de l'utiliser.
+
+    10. **`hangup_function`**
+       - Utilise cet outil une fois la conversation terminée et qu'il n'y a plus rien à faire pour aider l'appelant.
+
+    ### Interaction avec l'appelant
+    - Accueille l'appelant poliment et professionnellement, en français.
+    - Si ce n'est pas déjà fait, demande son nom complet.
+    - S'il a un problème ou une demande, pense à :
+      - Rechercher l'information pertinente avec l'outil approprié.
+      - Proposer de prendre un rendez-vous en boutique avec `book_service_appointment_function` si pertinent.
+      - Terminer en enregistrant ses coordonnées avec `log_support_ticket_function` si le problème nécessite un suivi.
+
+    ### Ton et approche
+    - Reste amical, patient et rassurant, surtout avec les clients frustrés.
+    - Évite le jargon technique sauf si l'appelant le demande.
+    - Guide le client comme un conseiller de service client compétent et bienveillant, avec pour objectif de résoudre son problème ou de s'assurer qu'il est correctement transmis.
+
+    ### Clôture d'appel
+    - Avant de terminer, demande toujours à l'appelant s'il a d'autres questions.
+    - Une fois qu'il n'en a plus, demande-lui s'il accepte de recevoir un court questionnaire de satisfaction par WhatsApp après l'appel.
+    - Appelle `send_whatsapp_form_function` avec sa réponse (voir la section « Outils à ta disposition » ci-dessus pour le détail).
+    - Remercie-le pour son appel et termine par une formule du type « Histoire d'Or vous souhaite une excellente journée. »
+    - Appelle ensuite toujours `hangup_function`.
+    """
+
+
+_sip_client = None
+
+
+@app.on_event("startup")
+async def _connect_sip_trunk():
+    """Registers this app to the Manivox SIP trunk at startup so inbound calls to
+    the SDA are answered directly, without going through Twilio."""
+    global _sip_client
+    if not os.getenv("SIP_SERVER"):
+        print("[SIP] SIP_SERVER not set, skipping SIP trunk registration.")
+        return
+    try:
+        _sip_client = await start_sip_agent(build_system_message, INITIAL_MESSAGE, inbound_support_tool_schemas)
+    except Exception as e:
+        print(f"[SIP] Failed to register to SIP trunk: {e}")
+
+
+@app.on_event("shutdown")
+async def _disconnect_sip_trunk():
+    if _sip_client is not None:
+        await _sip_client.close()
 
 # Database configuration
-DATABASE_URL = "postgresql://agent:sales@localhost:5432/CarDealership_db"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://agent:sales@localhost:5432/ThomGroupSupport_db")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-class LeadSchema(BaseModel):
+class SupportTicketSchema(BaseModel):
     id: int
     name: str
     phone_number: str
-    lead_source: Optional[str]
-    interest_score: int
-    call_summary: Optional[str]
+    issue_type: str
+    priority: int
+    summary: Optional[str]
 
     class Config:
         from_attributes = True
 
 
-@app.get("/leads", response_model=List[dict])
-def get_leads():
+@app.get("/support-tickets", response_model=List[dict])
+def get_support_tickets():
     try:
         # Establish database connection
         connection = get_db_connection()
         cursor = connection.cursor()
 
-        # SQL query to get lead details
+        # SQL query to get support ticket details
         query = """
-        SELECT 
+        SELECT
             id,
             name,
             phone_number,
-            lead_source,
-            interest_score,
-            call_summary
-        FROM leads
-        order by interest_score desc;
+            issue_type,
+            priority,
+            summary
+        FROM support_tickets
+        order by priority desc;
         """
 
         # Execute query
@@ -78,27 +258,27 @@ def get_leads():
         result = cursor.fetchall()
 
         # Format the result
-        leads = []
+        tickets = []
         for row in result:
-            leads.append({
+            tickets.append({
                 "id": row[0],
                 "name": row[1],
                 "phone_number": row[2],
-                "lead_source": row[3],
-                "interest_score": row[4],
-                "call_summary": row[5]
+                "issue_type": row[3],
+                "priority": row[4],
+                "summary": row[5]
             })
 
         cursor.close()
         connection.close()
 
-        if not leads:
-            raise HTTPException(status_code=404, detail="No leads found!")
+        if not tickets:
+            raise HTTPException(status_code=404, detail="No support tickets found!")
 
-        return JSONResponse(content=leads)
+        return JSONResponse(content=tickets)
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error fetching leads: {e}")
+        raise HTTPException(status_code=500, detail=f"Error fetching support tickets: {e}")
 
 # Dependency to get the DB session
 def get_db():
@@ -145,9 +325,9 @@ async def handle_incoming_call(request: Request):
     print(f"Twilio number: {to_number}")
     response = VoiceResponse()
     # <Say> punctuation to improve text-to-speech flow
-    response.say("Hello since there is no available in the dealership right now, we're connecting to our AI agent Andy.")
+    response.say("Bonjour, merci d'appeler le service client Histoire d'Or, nous vous mettons en relation avec votre conseiller virtuel.", language="fr-FR")
     response.pause(length=1)
-    response.say("Andy is on the phone!")
+    response.say("Votre conseiller virtuel est en ligne !", language="fr-FR")
     host = request.url.hostname
     connect = Connect()
     connect.stream(url=f'wss://{host}/media-stream/{from_number}')
@@ -157,70 +337,7 @@ async def handle_incoming_call(request: Request):
 
 @app.websocket("/media-stream/{customer_number}")
 async def handle_media_stream(websocket: WebSocket,customer_number: str):
-    system_message = """
-    You are a professional and engaging AI assistant working as a sales agent for AutoLux, a car dealership. Your mission is to guide callers through their car buying journey by answering their questions, offering recommendations, helping them book test drives, and recording potential leads for follow-up.
-
-    ### Car Sales Services
-    - Respond to customer inquiries about specific cars or types of vehicles.
-    - Offer detailed availability and pricing information based on user input.
-    - Help customers explore their options by suggesting models that fit their needs.
-    - Offer to **book a test drive** if the customer seems interested in a vehicle.
-    - End each call by capturing qualified leads into the system if the user shows any interest.
-    - Make sure to take the customer's full name.
-
-    ### Tools and Usage
-
-    You have access to the following tools to support your tasks:
-
-    1. **`find_car_by_model_function`**
-       - Use this if the caller mentions a specific car by model name (e.g., “Do you have a C Class?”).
-
-    2. **`find_cars_by_type_function`**
-       - Use this when the caller is looking for a general category like SUV, sedan, electric, hybrid, or luxury cars.
-
-    3. **`log_lead_with_call_summary_function`**
-       - Always use this at the **end of a call** if the caller showed any interest in a car, 
-       and after you have provided enough detail.
-       - Collect and pass:
-         - Full name
-         - Phone number which is """ + customer_number + """ (No need to ask the customer for this)
-         - Lead source (e.g., "Website", "Referral", "Instagram Ad")
-         - Interest score from 1 (low) to 5 (high)
-         - A concise summary of what was discussed
-       - This ensures the lead is saved into the CRM system for follow-up.
-
-    4. **`book_test_drive_function`**
-       - Use this if the customer wants to try a car in person.
-       - Ask for:
-         - Customer’s full name
-         - Desired car model
-         - Preferred date and time for the test drive
-       - The system will confirm the booking and send the customer a confirmation SMS.
-
-    5. **`hangup_function`**
-       - Use this once the conversation is over and there is nothing else to assist the caller with.
-
-    ### Caller Interaction
-    - Greet the caller politely and professionally.
-    - If not already known, ask for their full name and how they heard about AutoLux.
-    - If they express interest in a vehicle, remember to:
-      - Confirm the vehicle’s availability using the proper tool.
-      - Offer to book a test drive using `book_test_drive_function`.
-      - Close by logging their details with `log_lead_with_call_summary_function`.
-
-    ### Tone and Approach
-    - Stay friendly, focused, and informative.
-    - Avoid technical jargon unless the caller asks for it.
-    - Guide the customer like a knowledgeable dealership assistant, with the goal of helping them find a vehicle, book a test drive, and log them as a potential lead.
-
-    When the conversation ends, always call `hangup_function`.
-    """
-
-    initial_message = """Greet the caller to the car dealership that's called LuxAuto, say hey I'm Andy then greet the saying 
-    that since the other salesmen are full you're taking his call """
-
-
-    await handle_call(websocket,system_message,initial_message,inbound_caller_tool_schemas)
+    await handle_call(websocket, build_system_message(customer_number), INITIAL_MESSAGE, inbound_support_tool_schemas)
 
 
 if __name__ == "__main__":

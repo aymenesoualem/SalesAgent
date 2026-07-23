@@ -8,7 +8,7 @@ services:
     environment:
       POSTGRES_USER: agent
       POSTGRES_PASSWORD: sales
-      POSTGRES_DB: CarDealership_db
+      POSTGRES_DB: ThomGroupSupport_db
     ports:
       - "5432:5432"
     volumes:
@@ -25,23 +25,6 @@ services:
       - "8000:8000"
     volumes:
       - chroma_data:/data/chroma
-  n8n:
-    image: n8nio/n8n
-    container_name: n8n
-    restart: always
-    ports:
-      - "5678:5678"
-    environment:
-      - DB_SQLITE_DATA_MODE=filesystem
-      - N8N_BASIC_AUTH_ACTIVE=true
-      - N8N_BASIC_AUTH_USER=admin
-      - N8N_BASIC_AUTH_PASSWORD=admin123
-      - N8N_SECURE_COOKIE=false
-      - TZ=UTC
-    volumes:
-      - n8n_data:/home/node/.n8n
-    depends_on:
-      - postgres
 volumes:
   postgres_data:
   chroma_data:

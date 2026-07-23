@@ -1,8 +1,8 @@
 
 from twilio.twiml.voice_response import VoiceResponse
 
-from models.model import Lead, Car
-from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, Numeric, Boolean, TIMESTAMP, func
+from models.model import Product, Store, Order, SupportTicket, Customer
+from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, Numeric, TIMESTAMP, func
 from sqlalchemy.orm import relationship, sessionmaker
 import sys
 from datetime import date, datetime
@@ -13,19 +13,22 @@ from tavily import TavilyClient
 from twilio.rest import Client
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from utils.phone import normalize_phone_number
+
 load_dotenv()
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
-def book_test_drive(customer_name: str, phone: str, car_model: str, date_str: str, time_str: str):
+def book_service_appointment(customer_name: str, phone: str, service_type: str, store_city: str, date_str: str, time_str: str):
     """
-    Books a test drive for a customer and sends an SMS confirmation.
+    Books an in-store service appointment (repair, resizing, engraving, cleaning) and sends an SMS confirmation.
 
     Args:
         customer_name (str): Name of the customer.
         phone (str): Phone number of the customer.
-        car_model (str): Car model for the test drive.
+        service_type (str): Type of service requested (e.g. "Repair", "Resizing", "Engraving", "Cleaning").
+        store_city (str): City of the store where the service will take place.
         date_str (str): Date in format YYYY-MM-DD.
         time_str (str): Time in format HH:MM (24-hour).
 
@@ -49,10 +52,10 @@ def book_test_drive(customer_name: str, phone: str, car_model: str, date_str: st
         end_datetime = f"{date_str}T{time_str[:-2]}{int(time_str[-2:]) + 30:02d}:00"  # 30-min slot
 
         event = {
-            'summary': f"Test Drive - {car_model} ({customer_name})",
-            'description': f"Customer: {customer_name}, Phone: {phone}, Car: {car_model}",
-            'start': {'dateTime': start_datetime, 'timeZone': 'Africa/Casablanca'},
-            'end': {'dateTime': end_datetime, 'timeZone': 'Africa/Casablanca'},
+            'summary': f"{service_type} - {store_city} ({customer_name})",
+            'description': f"Customer: {customer_name}, Phone: {phone}, Service: {service_type}, Store city: {store_city}",
+            'start': {'dateTime': start_datetime, 'timeZone': 'Europe/Paris'},
+            'end': {'dateTime': end_datetime, 'timeZone': 'Europe/Paris'},
             'reminders': {
                 'useDefault': False,
                 'overrides': [
@@ -64,12 +67,10 @@ def book_test_drive(customer_name: str, phone: str, car_model: str, date_str: st
 
         event_result = service.events().insert(calendarId=calendar_id, body=event).execute()
 
-        # Send SMS confirmation
-
-        return f"Test drive booked! Event ID: {event_result['id']}"
+        return f"Appointment booked! Event ID: {event_result['id']}"
 
     except Exception as e:
-        return f"Failed to book test drive: {e}"
+        return f"Failed to book appointment: {e}"
 
 
 def send_sms(to: str, body: str):
@@ -92,88 +93,234 @@ def send_sms(to: str, body: str):
 
     return message.sid  # Return the SID of the sent message for reference
 
-# if __name__ == '__main__':
-#     send_sms("+212679675314","Hi")
-#     result = web_scraper_for_recommendation("Nice things to do in casa")
-#     print (result)
+
+# The agent only handles the Histoire d'Or enseigne, not the rest of THOM Group.
+HISTOIRE_DOR_BRAND = "Histoire d'Or"
+HISTOIRE_DOR_WEBSITE = "histoiredor.com"
 
 
-def find_car_by_model(model: str):
+def find_product_by_name(name: str):
     """
-    Search for a car by name using partial match (case-insensitive).
+    Search the local Histoire d'Or catalog for a product by name using partial match (case-insensitive).
     """
     session = get_session()
     try:
-        cars = session.query(Car).filter(Car.model.ilike(f"%{model}%")).all()
-        if not cars:
-            return f"No cars found matching '{model}'."
+        products = session.query(Product).filter(
+            Product.brand.ilike(HISTOIRE_DOR_BRAND),
+            Product.name.ilike(f"%{name}%"),
+        ).all()
+        if not products:
+            return f"No products found matching '{name}'."
 
-        car_details = []
-        for car in cars:
-            availability = "Available" if car.available else "Not Available"
-            car_details.append(
-                f"ID: {car.id}, Make: {car.make}, Model: {car.model}, Year: {car.year}, "
-                f"Type: {car.type}, Price: ${car.price}, Status: {availability}"
+        product_details = []
+        for product in products:
+            availability = "In Stock" if product.in_stock else "Out of Stock"
+            product_details.append(
+                f"ID: {product.id}, Brand: {product.brand}, Name: {product.name}, Category: {product.category}, "
+                f"Material: {product.material}, Price: ${product.price}, Status: {availability}"
             )
 
-        return "\n".join(car_details)
-    finally:
-        session.close()
-def get_cars_by_type(car_type: str):
-    """
-    Retrieve all cars of a specific type (case-insensitive).
-    """
-    session = get_session()
-    try:
-        cars = session.query(Car).filter(Car.type.ilike(car_type)).all()
-        return [car.model for car in cars]
+        return "\n".join(product_details)
     finally:
         session.close()
 
-# Logging a lead with a call summary
-def log_lead_with_call_summary(full_name, phone_number, lead_source, interest_score, call_summary):
+def get_products_by_category(category: str):
+    """
+    Retrieve all Histoire d'Or products of a specific category (case-insensitive), e.g. Ring, Necklace, Bracelet, Earrings, Watch.
+    """
     session = get_session()
     try:
-        lead = Lead(
+        products = session.query(Product).filter(
+            Product.brand.ilike(HISTOIRE_DOR_BRAND),
+            Product.category.ilike(category),
+        ).all()
+        return [f"{p.brand} - {p.name}" for p in products]
+    finally:
+        session.close()
+
+
+def search_product_on_histoire_dor_website(query: str):
+    """
+    Search histoiredor.com for real-time product information (description, pricing,
+    availability) when the local catalog doesn't have what the caller is asking about.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        return "Product search on the website is currently unavailable."
+
+    try:
+        client = TavilyClient(api_key=api_key)
+        response = client.search(
+            query=query,
+            include_domains=[HISTOIRE_DOR_WEBSITE],
+            max_results=5,
+        )
+        results = response.get("results", [])
+        if not results:
+            return f"No product information found for '{query}' on {HISTOIRE_DOR_WEBSITE}."
+
+        lines = []
+        for r in results:
+            title = (r.get("title") or "").strip()
+            url = r.get("url") or ""
+            content = (r.get("content") or "").strip()
+            if len(content) > 300:
+                content = content[:300] + "..."
+            lines.append(f"{title} ({url}): {content}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error searching product on {HISTOIRE_DOR_WEBSITE}: {e}"
+
+
+def check_order_status(order_number: str):
+    """
+    Look up an order by its order number and return its current status.
+    """
+    session = get_session()
+    try:
+        order = session.query(Order).filter(Order.order_number.ilike(order_number)).first()
+        if not order:
+            return f"No order found with number '{order_number}'."
+
+        return (
+            f"Order {order.order_number} for {order.customer_name}: {order.product_name} "
+            f"(Ref: {order.product_reference}) - Status: {order.status}, "
+            f"Estimated delivery: {order.estimated_delivery}"
+        )
+    finally:
+        session.close()
+
+
+def get_orders_by_phone(phone_number: str):
+    """
+    Look up all known orders placed under a phone number, matched regardless of
+    formatting (e.g. '+33...' vs '0033...'). Used to give the agent order context
+    up front for a known caller, instead of waiting for them to state an order number.
+    """
+    session = get_session()
+    try:
+        normalized = normalize_phone_number(phone_number)
+        if not normalized:
+            return []
+        orders = session.query(Order).filter(Order.phone_number == normalized).all()
+        return [
+            {
+                "order_number": o.order_number,
+                "customer_name": o.customer_name,
+                "product_reference": o.product_reference,
+                "product_name": o.product_name,
+                "status": o.status,
+                "estimated_delivery": o.estimated_delivery.isoformat() if o.estimated_delivery else None,
+            }
+            for o in orders
+        ]
+    finally:
+        session.close()
+
+
+def find_store_by_city(city: str):
+    """
+    Retrieve Histoire d'Or store details (name, address, phone, opening hours) for a given city.
+    """
+    session = get_session()
+    try:
+        stores = session.query(Store).filter(
+            Store.name.ilike(f"{HISTOIRE_DOR_BRAND}%"),
+            Store.city.ilike(f"%{city}%"),
+        ).all()
+        if not stores:
+            return f"No stores found in '{city}'."
+
+        store_details = []
+        for store in stores:
+            store_details.append(
+                f"{store.name} - {store.address}, Phone: {store.phone}, Hours: {store.opening_hours}"
+            )
+
+        return "\n".join(store_details)
+    finally:
+        session.close()
+
+
+# Logging a support ticket with a call summary
+def log_support_ticket(full_name, phone_number, issue_type, priority, summary):
+    session = get_session()
+    try:
+        ticket = SupportTicket(
             name=full_name,
             phone_number=phone_number,
-            lead_source=lead_source,
-            interest_score=interest_score,
-            call_summary=call_summary
+            issue_type=issue_type,
+            priority=priority,
+            summary=summary
         )
-        session.add(lead)
+        session.add(ticket)
         session.commit()
-        return f"Lead for {full_name} logged."
+        return f"Support ticket for {full_name} logged."
     except Exception as e:
         session.rollback()
         return f"Error: {e}"
     finally:
         session.close()
 
+# Registering a new customer, or looking one up by phone number for an incoming call
+def add_customer(full_name, phone_number):
+    session = get_session()
+    try:
+        normalized = normalize_phone_number(phone_number)
+        existing = session.query(Customer).filter(
+            Customer.phone_number == normalized,
+            Customer.full_name.ilike(full_name)
+        ).first()
+        if existing:
+            return f"Customer {full_name} is already registered."
+
+        customer = Customer(full_name=full_name, phone_number=normalized)
+        session.add(customer)
+        session.commit()
+        return f"Customer {full_name} added."
+    except Exception as e:
+        session.rollback()
+        return f"Error: {e}"
+    finally:
+        session.close()
+
+
+def get_customer_by_phone(phone_number: str):
+    """
+    Look up known customers registered under a phone number, matched regardless of
+    formatting (e.g. '+33...' vs '0033...'). A phone number can be shared by more
+    than one known customer (e.g. a household line), so this returns a list.
+    """
+    session = get_session()
+    try:
+        normalized = normalize_phone_number(phone_number)
+        if not normalized:
+            return []
+        customers = session.query(Customer).filter(Customer.phone_number == normalized).all()
+        return [{"full_name": c.full_name, "phone_number": c.phone_number} for c in customers]
+    finally:
+        session.close()
+
+
 def hangup():
     response = VoiceResponse()
     response.hangup()
     return response
 def get_session():
-    DATABASE_URL = "postgresql://agent:sales@localhost:5432/CarDealership_db"
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://agent:sales@localhost:5432/ThomGroupSupport_db")
     engine = create_engine(DATABASE_URL)
     Session = sessionmaker(bind=engine)
     return Session()
 
 if __name__ == '__main__':
-    # Test: Log a lead
+    # Test: Search product by name
+    print("\nTesting find_product_by_name:")
+    products_named = find_product_by_name("Ring")
+    print(products_named)
 
-    # Test: Search car by name
-    print("\nTesting find_car_by_name:")
-    cars_named = find_car_by_model("Toyota", get_session)
-    for car in cars_named:
-        print(car)
-
-    # Test: Search car by type
-    print("\nTesting get_cars_by_type:")
-    cars_of_type = get_cars_by_type("Sedan", get_session)
-    for car in cars_of_type:
-        print(car)
-
-
-
+    # Test: Search products by category
+    print("\nTesting get_products_by_category:")
+    products_of_category = get_products_by_category("Ring")
+    for product in products_of_category:
+        print(product)
