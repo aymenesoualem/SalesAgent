@@ -1,25 +1,26 @@
-# 🤖 Andy the Sales Agent
+# 🤖 Léa, THOM Group Customer Support Agent
 
-Andy is a smart, voice-based AI sales agent designed to handle inbound calls from potential leads, engage them in natural conversation, assess their level of interest, and summarize the call—all autonomously.
+Léa is a smart, voice-based AI customer support agent for **THOM Group** (jewelry & accessories retail group — Histoire d'Or, Marc Orian, AGATHA, Stroili, Ti Sento, and licensed brands like Calvin Klein). She handles inbound customer calls, answers product and order questions, books in-store service appointments, and logs unresolved issues for human follow-up — all autonomously.
 
-![Project Logo](assets/Andy.png)
+Léa goes beyond answering calls. She can:
 
-Inspired by high-energy sales trainers like **Andy Elliott** (hence the parody), this AI-powered agent goes beyond answering calls. Andy can:
-
-- Handle realistic voice conversations
-- Score the interest of the caller
-- Summarize entire transcripts into short, digestible notes
-- Book test drive appointments
-- Send confirmation emails to leads
+- Handle realistic voice conversations with customers
+- Look up products and check catalog availability
+- Check order status by order number
+- Find store locations, addresses, phone numbers, and opening hours
+- Book in-store service appointments (repair, resizing, engraving, cleaning) with SMS confirmation
+- Log a support ticket with a call summary when an issue needs follow-up
 
 ---
 
 ## 🧠 Key Features
 
-- 🎙️ **AI Voice Interaction**: Uses LLMs + voice APIs to converse with leads
-- 📝 **Real-time Transcript Summarization**: Post-call summary in natural language
-- 📅 **Calendar Integration**: Schedules test drives using Google Calendar (via GCP API)
-- 📧 **Email Confirmation**: Automatically sends appointment confirmation emails
+- 🎙️ **AI Voice Interaction**: Realtime speech-to-speech conversations via Azure AI Foundry's Realtime API
+- 🔍 **Product & Order Lookup**: Answers product questions and order status from the support database
+- 🏬 **Store Locator**: Finds store addresses, phone numbers, and hours by city
+- 📅 **Appointment Booking**: Schedules in-store services using Google Calendar
+- 📩 **SMS Confirmation**: Sends appointment confirmations via Twilio
+- 🎫 **Ticket Logging**: Saves unresolved issues to the support database for follow-up
 
 ---
 
@@ -33,20 +34,13 @@ Here's a high-level architecture of the full system:
 
 ## 🚀 Tech Stack
 
-- **LLMs**: OpenAI GPT for summarization and intent analysis
-- **Voice**: [Whisper / ElevenLabs / Twilio Voice] (depending on implementation)
-- **Scheduling**: Google Calendar API (GCP integration)
-- **Email**: SMTP / Gmail API for sending confirmation emails
-- **Frontend**: Streamlit or similar (optional for managing appointments)
+- **LLM / Voice**: Azure AI Foundry (Azure OpenAI Realtime API) for speech-to-speech conversation and tool calling
+- **Telephony**: Twilio Voice for inbound calls, Twilio SMS for confirmations
+- **Scheduling**: Google Calendar API (GCP integration) for service appointments
+- **Database**: PostgreSQL (products, stores, orders, support tickets) via SQLAlchemy
+- **Backend**: FastAPI + WebSockets
 - **Deployment**: Dockerized microservices, ready for cloud deployment
 
----
-
-## 📦 Coming Soon
-
-- 🔄 Conversation memory between calls
-- 📊 Lead scoring dashboard
-- 🔐 Voice authentication and security checks
 ---
 
 ## 📁 Assets
@@ -55,17 +49,12 @@ All media and workflow illustrations are available under the `assets/` directory
 
 ---
 
-## 💡 Inspiration
-
-The name *Andy* is a nod to real-world high-pressure sales personas, reimagined as a tireless AI who doesn’t sleep, doesn’t eat—and never forgets a lead.
-
----
-
 ## 📬 Contact
 
 Feel free to reach out for collaborations or questions:
 
-**Aymene Soualem**  
+**Aymene Soualem**
 GitHub: [@aymenesoualem](https://github.com/aymenesoualem)
 
 ---
+# Vagent-demo
